@@ -1,11 +1,14 @@
 """FastAPI service exposing the subtitle pipeline.
 
 One GPU means one job at a time, so work goes through a single worker thread.
-Uploads are capped by size and duration and rate limited per client.
+Every limit below is enforced server-side; the global budget is persisted so a
+restart cannot be used to reset it.
 """
 
+import json
 import os
 import queue
+import re
 import sys
 import tempfile
 import threading
@@ -16,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
@@ -40,24 +44,47 @@ configure_utf8_console()
 
 # --- Configuration (environment variables) -----------------------------------------
 DEFAULT_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "200"))
-MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "900"))  # 15 minutes
-RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "5"))
-JOB_TTL_SEC = int(os.getenv("JOB_TTL_SEC", "3600"))
+ALLOW_MODEL_OVERRIDE = os.getenv("ALLOW_MODEL_OVERRIDE", "false").lower() == "true"
+TERMS_FILE = os.getenv("TERMS_FILE", "").strip()
 API_KEY = os.getenv("API_KEY", "").strip()
 ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()
 ]
-ALLOW_MODEL_OVERRIDE = os.getenv("ALLOW_MODEL_OVERRIDE", "false").lower() == "true"
-TERMS_FILE = os.getenv("TERMS_FILE", "").strip()
+
+# Per-request limits.
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))
+MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "600"))
+
+# Per-client limits (best effort: a client that rotates IPs defeats these,
+# which is why the global budget below exists).
+RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "3"))
+RATE_LIMIT_PER_DAY = int(os.getenv("RATE_LIMIT_PER_DAY", "10"))
+
+# Global limits. These are the hard ceiling on what the machine can be made to
+# do, no matter how many clients or IP addresses ask.
+MAX_QUEUE_DEPTH = int(os.getenv("MAX_QUEUE_DEPTH", "5"))
+GLOBAL_JOBS_PER_HOUR = int(os.getenv("GLOBAL_JOBS_PER_HOUR", "20"))
+GLOBAL_JOBS_PER_DAY = int(os.getenv("GLOBAL_JOBS_PER_DAY", "100"))
+GLOBAL_AUDIO_MINUTES_PER_DAY = int(os.getenv("GLOBAL_AUDIO_MINUTES_PER_DAY", "180"))
+MAX_DISK_MB = int(os.getenv("MAX_DISK_MB", "1000"))
+JOB_TIMEOUT_SEC = int(os.getenv("JOB_TIMEOUT_SEC", "1800"))
+JOB_TTL_SEC = int(os.getenv("JOB_TTL_SEC", "3600"))
+
+# Cloudflare Turnstile. Leave the secret empty to disable the check.
+TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET", "").strip()
+TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+
+BUDGET_FILE = Path(os.getenv("BUDGET_FILE", Path(__file__).parent / "budget.json"))
+UPLOAD_DIR = Path(tempfile.gettempdir()) / "whisper_api_uploads"
 
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+MAX_DISK_BYTES = MAX_DISK_MB * 1024 * 1024
 ALLOWED_EXTENSIONS = {
     ".mp4", ".mov", ".mkv", ".avi", ".webm",
     ".mp3", ".wav", ".m4a", ".ogg", ".flac",
 }
 
-app = FastAPI(title="Whisper Subtitle Generator API", version="1.0.0")
+app = FastAPI(title="Whisper Subtitle Generator API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -83,55 +110,167 @@ class Job:
     srt: Optional[str] = None
     cue_count: int = 0
     created_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None
     source_path: Optional[str] = None
 
 
 _jobs = {}
 _jobs_lock = threading.Lock()
 _work_queue = queue.Queue()
+_queue_order = deque()  # job ids waiting, for position and ETA
 
-# Rate limiting: recent request timestamps per client key.
-_hits = defaultdict(deque)
+_hits_hour = defaultdict(deque)
+_hits_day = defaultdict(deque)
 _hits_lock = threading.Lock()
 
-# Backend handles, loaded lazily on the worker thread.
 _backend = {"torch": None, "whisper": None, "device": "cpu", "gpu_name": None}
 _model_cache = {"key": None, "model": None}
 _backend_lock = threading.Lock()
 
+# Observed transcription speed (audio seconds per wall second), for queue ETAs.
+_speed = {"factor": 6.0}
+
+
+# --- Global budget (persisted so a restart cannot reset it) --------------------------
+
+_budget_lock = threading.Lock()
+_budget = {"jobs": [], "audio": []}  # [ts, ...] and [[ts, seconds], ...]
+
+
+def _load_budget() -> None:
+    global _budget
+    try:
+        data = json.loads(BUDGET_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            _budget = {
+                "jobs": [float(t) for t in data.get("jobs", [])],
+                "audio": [[float(t), float(s)] for t, s in data.get("audio", [])],
+            }
+    except (OSError, ValueError, TypeError):
+        _budget = {"jobs": [], "audio": []}
+
+
+def _save_budget() -> None:
+    try:
+        BUDGET_FILE.write_text(json.dumps(_budget), encoding="utf-8")
+    except OSError:
+        pass  # a read-only disk must not break transcription
+
+
+def _prune_budget(now: float) -> None:
+    _budget["jobs"] = [t for t in _budget["jobs"] if now - t <= 86400]
+    _budget["audio"] = [entry for entry in _budget["audio"] if now - entry[0] <= 86400]
+
+
+def _budget_snapshot() -> dict:
+    now = time.time()
+    with _budget_lock:
+        _prune_budget(now)
+        jobs_hour = sum(1 for t in _budget["jobs"] if now - t <= 3600)
+        jobs_day = len(_budget["jobs"])
+        audio_day = sum(entry[1] for entry in _budget["audio"])
+    return {
+        "jobs_this_hour": jobs_hour,
+        "jobs_today": jobs_day,
+        "audio_minutes_today": round(audio_day / 60, 1),
+    }
+
+
+def _reserve_budget(audio_seconds: float) -> None:
+    """Claim one job plus its audio time, or reject. The hard global ceiling."""
+    now = time.time()
+    with _budget_lock:
+        _prune_budget(now)
+        jobs_hour = sum(1 for t in _budget["jobs"] if now - t <= 3600)
+        if jobs_hour >= GLOBAL_JOBS_PER_HOUR:
+            raise HTTPException(429, "The service is at its hourly capacity. Try again later.")
+        if len(_budget["jobs"]) >= GLOBAL_JOBS_PER_DAY:
+            raise HTTPException(429, "The service is at its daily capacity. Try again tomorrow.")
+
+        audio_day = sum(entry[1] for entry in _budget["audio"])
+        if audio_day + audio_seconds > GLOBAL_AUDIO_MINUTES_PER_DAY * 60:
+            raise HTTPException(429, "The service is at its daily audio limit. Try again tomorrow.")
+
+        _budget["jobs"].append(now)
+        _budget["audio"].append([now, audio_seconds])
+        _save_budget()
+
+
+# --- Guards ---------------------------------------------------------------------------
 
 def _client_key(request: Request) -> str:
-    """Identify a caller for rate limiting, honouring a reverse proxy header."""
-    forwarded = request.headers.get("x-forwarded-for", "")
+    forwarded = request.headers.get("cf-connecting-ip") or request.headers.get(
+        "x-forwarded-for", ""
+    )
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
 def _check_rate_limit(key: str) -> None:
-    if RATE_LIMIT_PER_HOUR <= 0:
-        return
     now = time.time()
     with _hits_lock:
-        hits = _hits[key]
-        while hits and now - hits[0] > 3600:
-            hits.popleft()
-        if len(hits) >= RATE_LIMIT_PER_HOUR:
-            retry_in = int(3600 - (now - hits[0]))
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"Rate limit reached ({RATE_LIMIT_PER_HOUR}/hour). "
-                    f"Try again in {retry_in}s."
-                ),
-            )
-        hits.append(now)
+        for window, store, cap in (
+            (3600, _hits_hour, RATE_LIMIT_PER_HOUR),
+            (86400, _hits_day, RATE_LIMIT_PER_DAY),
+        ):
+            if cap <= 0:
+                continue
+            hits = store[key]
+            while hits and now - hits[0] > window:
+                hits.popleft()
+            if len(hits) >= cap:
+                retry = int(window - (now - hits[0]))
+                unit = "hour" if window == 3600 else "day"
+                raise HTTPException(
+                    429, f"Limit reached ({cap} per {unit}). Try again in {retry}s."
+                )
+        _hits_hour[key].append(now)
+        _hits_day[key].append(now)
 
 
 def _require_api_key(provided: Optional[str]) -> None:
     if API_KEY and (provided or "").strip() != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+        raise HTTPException(401, "Invalid or missing API key.")
 
+
+async def _verify_turnstile(token: str, ip: str) -> None:
+    """Validate a Cloudflare Turnstile token. Tokens are single-use at Cloudflare."""
+    if not TURNSTILE_SECRET:
+        return
+    if not token:
+        raise HTTPException(403, "Captcha required.")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                TURNSTILE_VERIFY_URL,
+                data={"secret": TURNSTILE_SECRET, "response": token, "remoteip": ip},
+            )
+        data = response.json()
+    except (httpx.HTTPError, ValueError):
+        # Fail closed: an unverifiable request must not reach the GPU.
+        raise HTTPException(503, "Captcha verification unavailable. Try again shortly.")
+    if not data.get("success"):
+        raise HTTPException(403, "Captcha verification failed. Reload and try again.")
+
+
+def _check_disk_quota() -> None:
+    try:
+        used = sum(f.stat().st_size for f in UPLOAD_DIR.glob("*") if f.is_file())
+    except OSError:
+        return
+    if used >= MAX_DISK_BYTES:
+        raise HTTPException(503, "The service is busy. Try again shortly.")
+
+
+def _check_queue_depth() -> None:
+    with _jobs_lock:
+        waiting = sum(1 for j in _jobs.values() if j.status in ("queued", "running"))
+    if waiting >= MAX_QUEUE_DEPTH:
+        raise HTTPException(503, f"The queue is full ({MAX_QUEUE_DEPTH}). Try again shortly.")
+
+
+# --- Backend --------------------------------------------------------------------------
 
 def _ensure_backend():
     """Import torch/whisper once and pick the device. Worker thread only."""
@@ -169,7 +308,6 @@ def _load_model(name: str):
 
 
 def _model_is_cached(name: str) -> bool:
-    """True when the weights are already on disk, so no download stage is needed."""
     try:
         url = _backend["whisper"]._MODELS[name]
         return os.path.exists(os.path.join(whisper_cache_dir(), os.path.basename(url)))
@@ -185,10 +323,18 @@ def _update(job_id: str, **fields) -> None:
                 setattr(job, key, value)
 
 
+class JobTimeout(RuntimeError):
+    pass
+
+
 def _worker_loop() -> None:
     """Process one job at a time: a single GPU cannot usefully do more."""
     while True:
         job_id = _work_queue.get()
+        try:
+            _queue_order.remove(job_id)
+        except ValueError:
+            pass
         try:
             _process_job(job_id)
         except Exception as exc:  # never let the worker thread die
@@ -209,8 +355,10 @@ def _process_job(job_id: str) -> None:
         return
 
     source = Path(job.source_path)
+    started = time.time()
     try:
-        _update(job_id, status="running", stage="Loading model", progress=0.0)
+        _update(job_id, status="running", stage="Loading model", progress=0.0,
+                started_at=started)
         _ensure_backend()
 
         if not _model_is_cached(job.model):
@@ -218,8 +366,12 @@ def _process_job(job_id: str) -> None:
         model = _load_model(job.model)
 
         _update(job_id, stage="Transcribing", progress=0.0)
+        transcribe_started = time.time()
 
         def on_progress(fraction: float) -> None:
+            # Whisper calls this as it seeks, which doubles as a watchdog tick.
+            if time.time() - transcribe_started > JOB_TIMEOUT_SEC:
+                raise JobTimeout("Job exceeded its time limit and was stopped.")
             _update(job_id, progress=round(float(fraction), 4))
 
         with whisper_progress(on_progress):
@@ -230,6 +382,11 @@ def _process_job(job_id: str) -> None:
                 verbose=False,
             )
 
+        elapsed = max(0.001, time.time() - transcribe_started)
+        if job.duration:
+            observed = job.duration / elapsed
+            _speed["factor"] = _speed["factor"] * 0.7 + observed * 0.3
+
         _update(job_id, stage="Cleaning transcript", progress=1.0)
         terms, _warning = load_terms(Path(TERMS_FILE) if TERMS_FILE else None)
         cues = postprocess_segments(
@@ -237,16 +394,9 @@ def _process_job(job_id: str) -> None:
         )
         srt = build_srt(cues)
 
-        _update(
-            job_id,
-            status="done",
-            stage="Done",
-            progress=1.0,
-            srt=srt,
-            cue_count=len(cues),
-        )
+        _update(job_id, status="done", stage="Done", progress=1.0, srt=srt,
+                cue_count=len(cues))
     finally:
-        # The upload is only needed during transcription.
         try:
             source.unlink(missing_ok=True)
         except OSError:
@@ -255,7 +405,7 @@ def _process_job(job_id: str) -> None:
 
 
 def _cleanup_loop() -> None:
-    """Drop finished jobs (and their SRT text) once they age out."""
+    """Drop aged-out jobs and any orphaned uploads."""
     while True:
         time.sleep(60)
         cutoff = time.time() - JOB_TTL_SEC
@@ -268,10 +418,33 @@ def _cleanup_loop() -> None:
                         Path(job.source_path).unlink(missing_ok=True)
                     except OSError:
                         pass
+        try:
+            for leftover in UPLOAD_DIR.glob("*"):
+                if leftover.is_file() and leftover.stat().st_mtime < cutoff:
+                    leftover.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _estimate_wait(job_id: str) -> float:
+    """Seconds of audio ahead in the line, converted by observed speed."""
+    with _jobs_lock:
+        ahead = 0.0
+        for other in _jobs.values():
+            if other.id == job_id:
+                continue
+            if other.status == "running":
+                remaining = (other.duration or 0) * (1 - other.progress)
+                ahead += remaining
+            elif other.status == "queued" and other.created_at < _jobs[job_id].created_at:
+                ahead += other.duration or 0
+    return round(ahead / max(0.5, _speed["factor"]), 1)
 
 
 @app.on_event("startup")
 def _startup() -> None:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _load_budget()
     threading.Thread(target=_worker_loop, daemon=True).start()
     threading.Thread(target=_cleanup_loop, daemon=True).start()
 
@@ -291,12 +464,16 @@ def health():
         "models": MODEL_CHOICES if ALLOW_MODEL_OVERRIDE else [DEFAULT_MODEL],
         "languages": LANGUAGES,
         "queue_depth": active,
+        "captcha_required": bool(TURNSTILE_SECRET),
         "limits": {
             "max_upload_mb": MAX_UPLOAD_MB,
             "max_duration_sec": MAX_DURATION_SEC,
             "rate_limit_per_hour": RATE_LIMIT_PER_HOUR,
+            "rate_limit_per_day": RATE_LIMIT_PER_DAY,
+            "max_queue_depth": MAX_QUEUE_DEPTH,
             "api_key_required": bool(API_KEY),
         },
+        "budget": _budget_snapshot(),
     }
 
 
@@ -306,10 +483,22 @@ async def transcribe(
     file: UploadFile = File(...),
     language: str = Form("tr"),
     model: str = Form(""),
+    turnstile_token: str = Form(""),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
+    # Cheapest checks first, so abuse is rejected before it costs anything.
     _require_api_key(x_api_key)
-    _check_rate_limit(_client_key(request))
+
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES + 1024 * 1024:
+        raise HTTPException(413, f"File exceeds the {MAX_UPLOAD_MB} MB limit.")
+
+    _check_queue_depth()
+    _check_disk_quota()
+
+    client = _client_key(request)
+    _check_rate_limit(client)
+    await _verify_turnstile(turnstile_token, client)
 
     if language not in LANGUAGES.values():
         allowed = sorted(set(LANGUAGES.values()))
@@ -326,11 +515,9 @@ async def transcribe(
         allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
         raise HTTPException(400, f"Unsupported file type. Allowed: {allowed}.")
 
-    # Stream to disk, enforcing the size cap as we go rather than buffering it all.
-    upload_dir = Path(tempfile.gettempdir()) / "whisper_api_uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     job_id = uuid.uuid4().hex
-    target = upload_dir / f"{job_id}{suffix}"
+    target = UPLOAD_DIR / f"{job_id}{suffix}"
 
     written = 0
     try:
@@ -341,9 +528,7 @@ async def transcribe(
                     break
                 written += len(chunk)
                 if written > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        413, f"File exceeds the {MAX_UPLOAD_MB} MB limit."
-                    )
+                    raise HTTPException(413, f"File exceeds the {MAX_UPLOAD_MB} MB limit.")
                 out.write(chunk)
     except HTTPException:
         target.unlink(missing_ok=True)
@@ -366,9 +551,16 @@ async def transcribe(
             413, f"Media is {int(duration)}s long; the limit is {MAX_DURATION_SEC}s."
         )
 
+    # Only now, with the real duration known, claim global budget.
+    try:
+        _reserve_budget(duration)
+    except HTTPException:
+        target.unlink(missing_ok=True)
+        raise
+
     job = Job(
         id=job_id,
-        filename=file.filename or target.name,
+        filename=(file.filename or target.name)[:200],
         language=language,
         model=chosen,
         duration=duration,
@@ -376,6 +568,7 @@ async def transcribe(
     )
     with _jobs_lock:
         _jobs[job_id] = job
+    _queue_order.append(job_id)
     _work_queue.put(job_id)
 
     return {
@@ -383,6 +576,7 @@ async def transcribe(
         "duration": duration,
         "model": chosen,
         "language": language,
+        "queue_position": len(_queue_order),
     }
 
 
@@ -398,10 +592,8 @@ def job_status(job_id: str):
                 (j for j in _jobs.values() if j.status == "queued"),
                 key=lambda j: j.created_at,
             )
-            position = next(
-                (i + 1 for i, j in enumerate(queued) if j.id == job_id), 0
-            )
-        return {
+            position = next((i + 1 for i, j in enumerate(queued) if j.id == job_id), 0)
+        snapshot = {
             "job_id": job.id,
             "status": job.status,
             "stage": job.stage,
@@ -415,6 +607,8 @@ def job_status(job_id: str):
             "error": job.error,
             "srt_ready": job.srt is not None,
         }
+    snapshot["eta_seconds"] = _estimate_wait(job_id) if snapshot["status"] != "done" else 0
+    return snapshot
 
 
 @app.get("/api/jobs/{job_id}/srt")
@@ -431,11 +625,11 @@ def job_srt(job_id: str, download: bool = False):
 
     headers = {}
     if download:
-        stem = Path(filename).stem or "subtitles"
+        # Never interpolate a client-supplied name into a header unsanitised:
+        # a quote or newline would let the caller inject headers.
+        stem = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(filename).stem)[:80] or "subtitles"
         headers["Content-Disposition"] = f'attachment; filename="{stem}_{lang}.srt"'
-    return PlainTextResponse(
-        srt, media_type="text/plain; charset=utf-8", headers=headers
-    )
+    return PlainTextResponse(srt, media_type="text/plain; charset=utf-8", headers=headers)
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -456,4 +650,5 @@ if __name__ == "__main__":
         app,
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
+        limit_concurrency=int(os.getenv("LIMIT_CONCURRENCY", "50")),
     )

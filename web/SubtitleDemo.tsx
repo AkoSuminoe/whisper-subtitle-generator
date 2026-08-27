@@ -2,7 +2,7 @@
 
 /**
  * Uploads a media file, polls the job, and shows the cleaned SRT.
- *   <SubtitleDemo apiUrl="https://api.your-site.com" />
+ *   <SubtitleDemo apiUrl="https://api.your-site.com" turnstileSiteKey="0x4AAA..." />
  */
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
@@ -11,6 +11,8 @@ import styles from "./SubtitleDemo.module.css";
 export interface SubtitleDemoProps {
   /** Base URL of the API, with no trailing slash. */
   apiUrl: string;
+  /** Cloudflare Turnstile site key. Omit only if the server has no secret set. */
+  turnstileSiteKey?: string;
   /** Sent as X-API-Key when the server is configured to require one. */
   apiKey?: string;
   /** "tr" or "en". Defaults to Turkish. */
@@ -28,13 +30,30 @@ interface JobStatus {
   progress: number;
   duration: number | null;
   queue_position: number;
+  eta_seconds: number;
   cue_count: number;
   error: string | null;
-  srt_ready: boolean;
+}
+
+interface Limits {
+  max_upload_mb: number;
+  max_duration_sec: number;
+  rate_limit_per_hour: number;
 }
 
 const ACCEPT = ".mp4,.mov,.mkv,.avi,.webm,.mp3,.wav,.m4a,.ogg,.flac";
 const POLL_MS = 1000;
+const TURNSTILE_SRC = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (el: HTMLElement, opts: Record<string, unknown>) => string;
+      reset: (id?: string) => void;
+      remove: (id?: string) => void;
+    };
+  }
+}
 
 function formatClock(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "00:00";
@@ -51,8 +70,28 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Load the Turnstile script once per page. */
+function loadTurnstile(): Promise<void> {
+  if (typeof window === "undefined") return Promise.resolve();
+  if (window.turnstile) return Promise.resolve();
+  const existing = document.querySelector(`script[src="${TURNSTILE_SRC}"]`);
+  if (existing) {
+    return new Promise((resolve) => existing.addEventListener("load", () => resolve()));
+  }
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = TURNSTILE_SRC;
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Could not load the captcha."));
+    document.head.appendChild(script);
+  });
+}
+
 export default function SubtitleDemo({
   apiUrl,
+  turnstileSiteKey,
   apiKey,
   defaultLanguage = "tr",
   allowModelChoice = false,
@@ -66,29 +105,71 @@ export default function SubtitleDemo({
   const [phase, setPhase] = useState<Phase>("idle");
   const [uploadPct, setUploadPct] = useState(0);
   const [job, setJob] = useState<JobStatus | null>(null);
-  const [jobId, setJobId] = useState<string | null>(null);
-  const [srt, setSrt] = useState<string>("");
-  const [error, setError] = useState<string>("");
+  const [srt, setSrt] = useState("");
+  const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [token, setToken] = useState("");
+  const [limits, setLimits] = useState<Limits | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const xhrRef = useRef<XMLHttpRequest | null>(null);
   const aliveRef = useRef(true);
+  const captchaRef = useRef<HTMLDivElement | null>(null);
+  const widgetRef = useRef<string | null>(null);
 
   useEffect(() => {
     aliveRef.current = true;
     return () => {
-      // Stop polling and cancel any in-flight upload when unmounted.
       aliveRef.current = false;
       if (pollRef.current) clearTimeout(pollRef.current);
       xhrRef.current?.abort();
     };
   }, []);
 
-  const headers = useCallback((): HeadersInit => {
-    return apiKey ? { "X-API-Key": apiKey } : {};
-  }, [apiKey]);
+  // Advertise the server's real limits rather than hard-coding them here.
+  useEffect(() => {
+    fetch(`${base}/api/health`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (aliveRef.current && data?.limits) setLimits(data.limits);
+      })
+      .catch(() => undefined);
+  }, [base]);
+
+  useEffect(() => {
+    if (!turnstileSiteKey || !captchaRef.current) return;
+    let cancelled = false;
+    loadTurnstile()
+      .then(() => {
+        if (cancelled || !captchaRef.current || !window.turnstile) return;
+        widgetRef.current = window.turnstile.render(captchaRef.current, {
+          sitekey: turnstileSiteKey,
+          callback: (t: string) => setToken(t),
+          "expired-callback": () => setToken(""),
+          "error-callback": () => setToken(""),
+          theme: "auto",
+        });
+      })
+      .catch(() => setError("Could not load the captcha. Check your connection."));
+    return () => {
+      cancelled = true;
+      if (widgetRef.current && window.turnstile) {
+        window.turnstile.remove(widgetRef.current);
+        widgetRef.current = null;
+      }
+    };
+  }, [turnstileSiteKey]);
+
+  const headers = useCallback(
+    (): HeadersInit => (apiKey ? { "X-API-Key": apiKey } : {}),
+    [apiKey],
+  );
+
+  const resetCaptcha = useCallback(() => {
+    setToken("");
+    if (widgetRef.current && window.turnstile) window.turnstile.reset(widgetRef.current);
+  }, []);
 
   const reset = useCallback(() => {
     if (pollRef.current) clearTimeout(pollRef.current);
@@ -96,7 +177,6 @@ export default function SubtitleDemo({
     setPhase("idle");
     setUploadPct(0);
     setJob(null);
-    setJobId(null);
     setSrt("");
     setError("");
     setCopied(false);
@@ -104,10 +184,14 @@ export default function SubtitleDemo({
 
   const selectFile = useCallback(
     (next: File | null) => {
+      if (next && limits && next.size > limits.max_upload_mb * 1024 * 1024) {
+        setError(`File is too large. The limit is ${limits.max_upload_mb} MB.`);
+        return;
+      }
       reset();
       setFile(next);
     },
-    [reset],
+    [reset, limits],
   );
 
   const poll = useCallback(
@@ -126,9 +210,7 @@ export default function SubtitleDemo({
           return;
         }
         if (status.status === "done") {
-          const srtRes = await fetch(`${base}/api/jobs/${id}/srt`, {
-            headers: headers(),
-          });
+          const srtRes = await fetch(`${base}/api/jobs/${id}/srt`, { headers: headers() });
           if (!srtRes.ok) throw new Error(`Could not fetch the SRT (${srtRes.status})`);
           const text = await srtRes.text();
           if (!aliveRef.current) return;
@@ -148,6 +230,10 @@ export default function SubtitleDemo({
 
   const start = useCallback(() => {
     if (!file) return;
+    if (turnstileSiteKey && !token) {
+      setError("Please complete the captcha first.");
+      return;
+    }
     setPhase("uploading");
     setUploadPct(0);
     setError("");
@@ -157,6 +243,7 @@ export default function SubtitleDemo({
     const form = new FormData();
     form.append("file", file);
     form.append("language", language);
+    form.append("turnstile_token", token);
     if (allowModelChoice) form.append("model", model);
 
     // XHR rather than fetch: only XHR reports upload progress.
@@ -179,8 +266,9 @@ export default function SubtitleDemo({
       } catch {
         /* non-JSON error body */
       }
+      // The token is single-use, so a new one is needed either way.
+      resetCaptcha();
       if (xhr.status >= 200 && xhr.status < 300 && payload.job_id) {
-        setJobId(payload.job_id);
         setPhase("working");
         poll(payload.job_id);
       } else {
@@ -191,12 +279,16 @@ export default function SubtitleDemo({
 
     xhr.onerror = () => {
       if (!aliveRef.current) return;
+      resetCaptcha();
       setError("Network error. Is the API reachable and CORS configured?");
       setPhase("error");
     };
 
     xhr.send(form);
-  }, [file, language, model, allowModelChoice, base, apiKey, poll]);
+  }, [
+    file, language, model, allowModelChoice, base, apiKey, poll, token,
+    turnstileSiteKey, resetCaptcha,
+  ]);
 
   const download = useCallback(() => {
     const blob = new Blob([srt], { type: "text/plain;charset=utf-8" });
@@ -221,17 +313,8 @@ export default function SubtitleDemo({
     }
   }, [srt]);
 
-  const onDrop = useCallback(
-    (event: React.DragEvent) => {
-      event.preventDefault();
-      setDragging(false);
-      const dropped = event.dataTransfer.files?.[0];
-      if (dropped) selectFile(dropped);
-    },
-    [selectFile],
-  );
-
   const busy = phase === "uploading" || phase === "working";
+  const queued = phase === "working" && job?.status === "queued";
   const pct = phase === "uploading" ? uploadPct : Math.round((job?.progress ?? 0) * 100);
 
   let statusLine = "";
@@ -239,10 +322,8 @@ export default function SubtitleDemo({
     statusLine = `Uploading... ${uploadPct}%`;
   } else if (phase === "working" && job) {
     if (job.status === "queued") {
-      statusLine =
-        job.queue_position > 1
-          ? `Queued - position ${job.queue_position}`
-          : "Queued - starting shortly";
+      const wait = job.eta_seconds > 0 ? ` · about ${formatClock(job.eta_seconds)} left` : "";
+      statusLine = `In line — position ${job.queue_position}${wait}`;
     } else if (job.stage === "Transcribing" && job.duration) {
       statusLine = `Transcribing... ${pct}% (${formatClock(
         job.progress * job.duration,
@@ -251,13 +332,18 @@ export default function SubtitleDemo({
       statusLine = job.stage;
     }
   } else if (phase === "done" && job) {
-    statusLine = `Done - ${job.cue_count} subtitles`;
+    statusLine = `Done — ${job.cue_count} subtitles`;
   }
+
+  const canStart = !!file && !busy && (!turnstileSiteKey || !!token);
 
   return (
     <div className={[styles.root, className].filter(Boolean).join(" ")}>
       <div className={styles.header}>
-        <h2 className={styles.title}>Whisper Subtitle Generator</h2>
+        <div>
+          <h2 className={styles.title}>Subtitle Generator</h2>
+          <p className={styles.subtitle}>Video or audio in, clean SRT out.</p>
+        </div>
         <span className={styles.badge}>large-v3 · GPU</span>
       </div>
 
@@ -270,7 +356,12 @@ export default function SubtitleDemo({
           setDragging(true);
         }}
         onDragLeave={() => setDragging(false)}
-        onDrop={onDrop}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragging(false);
+          const dropped = e.dataTransfer.files?.[0];
+          if (dropped) selectFile(dropped);
+        }}
       >
         <input
           type="file"
@@ -279,6 +370,9 @@ export default function SubtitleDemo({
           disabled={busy}
           onChange={(e) => selectFile(e.target.files?.[0] ?? null)}
         />
+        <span className={styles.dropIcon} aria-hidden="true">
+          {file ? "🎬" : "⬆"}
+        </span>
         {file ? (
           <>
             <strong className={styles.fileName}>{file.name}</strong>
@@ -292,6 +386,13 @@ export default function SubtitleDemo({
         )}
       </label>
 
+      {limits && (
+        <p className={styles.limits}>
+          Up to {limits.max_upload_mb} MB and {Math.round(limits.max_duration_sec / 60)}{" "}
+          minutes · {limits.rate_limit_per_hour} per hour
+        </p>
+      )}
+
       <div className={styles.controls}>
         <div className={styles.control}>
           <span className={styles.label}>Language</span>
@@ -302,10 +403,7 @@ export default function SubtitleDemo({
                 type="button"
                 disabled={busy}
                 onClick={() => setLanguage(code)}
-                className={[
-                  styles.segment,
-                  language === code ? styles.segmentActive : "",
-                ]
+                className={[styles.segment, language === code ? styles.segmentActive : ""]
                   .filter(Boolean)
                   .join(" ")}
               >
@@ -332,13 +430,14 @@ export default function SubtitleDemo({
         )}
       </div>
 
+      {turnstileSiteKey && (
+        <div className={styles.captcha}>
+          <div ref={captchaRef} />
+        </div>
+      )}
+
       <div className={styles.actions}>
-        <button
-          type="button"
-          className={styles.primary}
-          onClick={start}
-          disabled={!file || busy}
-        >
+        <button type="button" className={styles.primary} onClick={start} disabled={!canStart}>
           {busy ? "Working..." : "Generate Subtitles"}
         </button>
         {(phase === "done" || phase === "error") && (
@@ -352,19 +451,10 @@ export default function SubtitleDemo({
         <div className={styles.progressWrap}>
           <div className={styles.progressTrack}>
             <div
-              className={[
-                styles.progressBar,
-                phase === "working" && job?.status === "queued"
-                  ? styles.progressIndeterminate
-                  : "",
-              ]
+              className={[styles.progressBar, queued ? styles.progressIndeterminate : ""]
                 .filter(Boolean)
                 .join(" ")}
-              style={
-                phase === "working" && job?.status === "queued"
-                  ? undefined
-                  : { width: `${pct}%` }
-              }
+              style={queued ? undefined : { width: `${pct}%` }}
             />
           </div>
           <span className={styles.status}>{statusLine}</span>

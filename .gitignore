@@ -39,3 +39,6 @@ build/
 Thumbs.db
 .vscode/
 .idea/
+
+# Server runtime budget (persisted limits)
+server/budget.json
