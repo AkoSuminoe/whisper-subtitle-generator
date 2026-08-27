@@ -1,0 +1,41 @@
+# Virtual environment (4.5 GB - never commit)
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Your personal dictionary. The app creates this on first run.
+# Ship terms.example.json instead; copy it to terms.json to start from it.
+terms.json
+
+# Generated subtitles and media
+*.srt
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.mp3
+*.wav
+
+# Server runtime
+server/uploads/
+server/jobs/
+.env
+.env.local
+
+# Node / web
+node_modules/
+.next/
+dist/
+build/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
