@@ -24,8 +24,19 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 
+SERVER_DIR = Path(__file__).resolve().parent
+
+# Load server/.env before anything reads os.getenv below. Without this the file
+# is silently ignored and the captcha stays off while looking configured.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(SERVER_DIR / ".env")
+except ImportError:
+    pass
+
 # subtitle_core lives one level up, beside app.py.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(SERVER_DIR.parent))
 
 from subtitle_core import (  # noqa: E402
     LANGUAGES,
@@ -74,7 +85,7 @@ JOB_TTL_SEC = int(os.getenv("JOB_TTL_SEC", "3600"))
 TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET", "").strip()
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 
-BUDGET_FILE = Path(os.getenv("BUDGET_FILE", Path(__file__).parent / "budget.json"))
+BUDGET_FILE = Path(os.getenv("BUDGET_FILE") or SERVER_DIR / "budget.json")
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "whisper_api_uploads"
 
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
