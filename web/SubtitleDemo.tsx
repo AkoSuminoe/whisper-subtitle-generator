@@ -5,7 +5,7 @@
  *   <SubtitleDemo apiUrl="https://api.your-site.com" turnstileSiteKey="0x4AAA..." />
  */
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import styles from "./SubtitleDemo.module.css";
 
 export interface SubtitleDemoProps {
@@ -76,7 +76,18 @@ function loadTurnstile(): Promise<void> {
   if (window.turnstile) return Promise.resolve();
   const existing = document.querySelector(`script[src="${TURNSTILE_SRC}"]`);
   if (existing) {
-    return new Promise((resolve) => existing.addEventListener("load", () => resolve()));
+    // The tag may already have loaded, in which case "load" never fires again.
+    return new Promise((resolve) => {
+      if (window.turnstile) return resolve();
+      existing.addEventListener("load", () => resolve());
+      const poll = setInterval(() => {
+        if (window.turnstile) {
+          clearInterval(poll);
+          resolve();
+        }
+      }, 100);
+      setTimeout(() => clearInterval(poll), 15000);
+    });
   }
   return new Promise((resolve, reject) => {
     const script = document.createElement("script");
@@ -174,13 +185,14 @@ export default function SubtitleDemo({
   const reset = useCallback(() => {
     if (pollRef.current) clearTimeout(pollRef.current);
     xhrRef.current?.abort();
+    resetCaptcha();
     setPhase("idle");
     setUploadPct(0);
     setJob(null);
     setSrt("");
     setError("");
     setCopied(false);
-  }, []);
+  }, [resetCaptcha]);
 
   const selectFile = useCallback(
     (next: File | null) => {
