@@ -42,3 +42,9 @@ Thumbs.db
 
 # Server runtime budget (persisted limits)
 server/budget.json
+
+# Coverage output
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/

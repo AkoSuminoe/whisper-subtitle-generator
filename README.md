@@ -8,6 +8,8 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
 ![Whisper](https://img.shields.io/badge/Whisper-large--v3-412991?logo=openai&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-CUDA-ee4c2c?logo=pytorch&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-87%20passing-2fa572)
+![Coverage](https://img.shields.io/badge/coverage-90%25-2fa572)
 ![License](https://img.shields.io/badge/License-MIT-a3e635)
 
 **[Live demo](https://whisper.berktan.dev)**
@@ -97,6 +99,39 @@ uvicorn server.main:app --host 127.0.0.1 --port 8000
 The desktop application is separate and needs no server: run `start.bat`, or `python app.py`.
 
 `ffmpeg` must be on `PATH`.
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest --cov
+```
+
+The suite needs **no GPU, no ffmpeg and no network**. Torch and Whisper are replaced with stubs, so what runs is the part worth testing: the clean-up pipeline, the limits, and the queue. It finishes in about five seconds.
+
+| Module | Coverage |
+| --- | --- |
+| `subtitle_core.py` | 93% |
+| `server/main.py` | 88% |
+| **Total** | **90%** — 87 tests |
+
+| File | Covers |
+| --- | --- |
+| `tests/test_pipeline.py` | Turkish casing, the terms dictionary, cue layout, the drop rules, SRT rendering |
+| `tests/test_server.py` | Upload validation, every limit, the captcha, queue reporting, worker failure |
+| `tests/test_progress_hook.py` | The tqdm swap that produces real progress, and its restoration |
+| `tests/test_backend.py` | Device detection, the single-slot model cache, budget bookkeeping |
+
+Two properties are worth singling out, because they are the ones a reader is entitled to doubt:
+
+- `test_global_cap_holds_under_ip_rotation` accepts up to the global ceiling, then makes four further requests from four different addresses and asserts every one is refused. Per-client limits are defeated by rotation; this is the limit that is not.
+- `test_budget_survives_a_restart` fills the hourly cap, reloads the module from the persisted file, and asserts the cap is still full. A limit a process forgets when it crashes is not a limit.
+
+### What is not covered
+
+The 10% is almost entirely code that only runs with real hardware or on a real clock: loading Whisper onto the GPU, the transcription loop itself, the hourly cleanup thread, the job watchdog's timeout branch, and `ffprobe` parsing. `app.py` is excluded altogether — it is a Tkinter GUI, and testing it would mean testing Tk.
 
 ---
 

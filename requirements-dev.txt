@@ -1,0 +1,5 @@
+# Test dependencies. The suite needs no GPU, no ffmpeg and no network:
+# the Whisper backend is stubbed, so what runs is the pipeline and the API.
+-r server/requirements.txt
+pytest>=8.0
+pytest-cov>=5.0
