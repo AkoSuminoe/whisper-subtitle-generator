@@ -6,7 +6,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11+-3776ab?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
-![Whisper](https://img.shields.io/badge/Whisper-large--v3-412991?logo=openai&logoColor=white)
+![Whisper](https://img.shields.io/badge/Whisper-openai-412991?logo=openai&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-CUDA-ee4c2c?logo=pytorch&logoColor=white)
 [![tests](https://github.com/AkoSuminoe/whisper-subtitle-generator/actions/workflows/tests.yml/badge.svg)](https://github.com/AkoSuminoe/whisper-subtitle-generator/actions/workflows/tests.yml)
 ![Coverage](https://img.shields.io/badge/coverage-90%25-2fa572)
@@ -161,6 +161,20 @@ Two settings matter more than they look:
 - `HOST=127.0.0.1`, not `0.0.0.0`. The tunnel connects from the same machine, so binding every interface only exposes the server to the local network. It is also what makes trusting `cf-connecting-ip` sound: if the port were reachable directly, anyone could set that header and rotate through fake values to defeat the per-client limits.
 - `ALLOW_MODEL_OVERRIDE=false` in production, so a caller cannot ask for a larger model than you intended to pay for.
 
+### Which model to serve
+
+`server/.env.example` defaults to `large-v3`, which is the right default for someone running this for themselves: you are waiting on your own file and want the best transcript available.
+
+**The live demo runs `medium` instead.** A public demo behind one GPU is a throughput problem rather than an accuracy one — every second a job holds the GPU is a second everyone in the queue waits. The three options, in the order they are worth considering for a shared endpoint:
+
+| Model | Download | Trade |
+| --- | --- | --- |
+| `medium` | ~1.5 GB | Fastest and lightest. Noticeably weaker on Turkish proper nouns, which `terms.json` can largely correct |
+| `large-v3-turbo` | ~1.6 GB | A pruned large-v3: much faster per job, quality close to `large-v3`. The best balance for a shared endpoint |
+| `large-v3` | ~2.9 GB | The most accurate, and the slowest. Best when one person is waiting on one file |
+
+Whichever you choose, the front end does not need changing: `/api/health` reports `default_model` and the interface reads it from there.
+
 ---
 
 ## Configuration
@@ -169,6 +183,7 @@ Everything is environment driven; see `server/.env.example` for the full list wi
 
 | Variable | Why it matters |
 | --- | --- |
+| `WHISPER_MODEL` | `medium`, `large-v3-turbo` or `large-v3`. See [Which model to serve](#which-model-to-serve) |
 | `TURNSTILE_SECRET` | Empty disables the captcha entirely |
 | `MAX_UPLOAD_MB`, `MAX_DURATION_SEC` | The per-request ceiling |
 | `RATE_LIMIT_PER_HOUR`, `RATE_LIMIT_PER_DAY` | Per client, and best effort: IP rotation defeats them |
