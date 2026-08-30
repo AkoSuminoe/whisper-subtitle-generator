@@ -122,6 +122,9 @@ export default function SubtitleDemo({
   const [copied, setCopied] = useState(false);
   const [token, setToken] = useState("");
   const [limits, setLimits] = useState<Limits | null>(null);
+  const [termsText, setTermsText] = useState("");
+  const [termsError, setTermsError] = useState("");
+  const [termsOpen, setTermsOpen] = useState(false);
 
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const xhrRef = useRef<XMLHttpRequest | null>(null);
@@ -182,6 +185,27 @@ export default function SubtitleDemo({
     if (widgetRef.current && window.turnstile) window.turnstile.reset(widgetRef.current);
   }, []);
 
+  // Validate as the user types: a bad dictionary should be obvious before upload.
+  const onTermsChange = useCallback((value: string) => {
+    setTermsText(value);
+    const trimmed = value.trim();
+    if (!trimmed) {
+      setTermsError("");
+      return;
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        setTermsError('Must be an object, like {"wrong": "correct"}.');
+        return;
+      }
+      const bad = Object.entries(parsed).find(([, v]) => typeof v !== "string");
+      setTermsError(bad ? `"${bad[0]}" must map to text.` : "");
+    } catch {
+      setTermsError("Not valid JSON yet.");
+    }
+  }, []);
+
   const reset = useCallback(() => {
     if (pollRef.current) clearTimeout(pollRef.current);
     xhrRef.current?.abort();
@@ -192,6 +216,8 @@ export default function SubtitleDemo({
     setSrt("");
     setError("");
     setCopied(false);
+    setTermsText("");
+    setTermsError("");
   }, [resetCaptcha]);
 
   const selectFile = useCallback(
@@ -256,6 +282,7 @@ export default function SubtitleDemo({
     form.append("file", file);
     form.append("language", language);
     form.append("turnstile_token", token);
+    if (termsText.trim()) form.append("terms", termsText.trim());
     if (allowModelChoice) form.append("model", model);
 
     // XHR rather than fetch: only XHR reports upload progress.
@@ -299,7 +326,7 @@ export default function SubtitleDemo({
     xhr.send(form);
   }, [
     file, language, model, allowModelChoice, base, apiKey, poll, token,
-    turnstileSiteKey, resetCaptcha,
+    turnstileSiteKey, resetCaptcha, termsText,
   ]);
 
   const download = useCallback(() => {
@@ -347,7 +374,8 @@ export default function SubtitleDemo({
     statusLine = `Done — ${job.cue_count} subtitles`;
   }
 
-  const canStart = !!file && !busy && (!turnstileSiteKey || !!token);
+  const canStart =
+    !!file && !busy && !termsError && (!turnstileSiteKey || !!token);
 
   return (
     <div className={[styles.root, className].filter(Boolean).join(" ")}>
@@ -439,6 +467,36 @@ export default function SubtitleDemo({
               <option value="medium">medium</option>
             </select>
           </div>
+        )}
+      </div>
+
+      <div className={styles.terms}>
+        <button
+          type="button"
+          className={styles.termsToggle}
+          onClick={() => setTermsOpen((open) => !open)}
+          aria-expanded={termsOpen}
+        >
+          {termsOpen ? "▾" : "▸"} Custom terms (optional)
+        </button>
+        {termsOpen && (
+          <>
+            <p className={styles.hint}>
+              Fix words the model mishears. Used for this file only, then discarded.
+            </p>
+            <textarea
+              className={[styles.termsInput, termsError ? styles.termsInvalid : ""]
+                .filter(Boolean)
+                .join(" ")}
+              rows={4}
+              spellCheck={false}
+              disabled={busy}
+              value={termsText}
+              onChange={(e) => onTermsChange(e.target.value)}
+              placeholder={'{ "reyki": "reiki", "çakıra": "çakra" }'}
+            />
+            {termsError && <p className={styles.termsError}>{termsError}</p>}
+          </>
         )}
       </div>
 

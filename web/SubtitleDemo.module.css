@@ -337,3 +337,52 @@
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* --- custom terms --- */
+.terms {
+  margin-top: 16px;
+}
+
+.termsToggle {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--sd-muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.termsToggle:hover {
+  color: var(--sd-text);
+}
+
+.termsInput {
+  width: 100%;
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid var(--sd-border);
+  border-radius: var(--sd-radius);
+  background: var(--sd-surface);
+  color: var(--sd-text);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.termsInput:focus {
+  outline: 2px solid var(--sd-accent);
+  outline-offset: -1px;
+}
+
+.termsInvalid {
+  border-color: var(--sd-bad);
+}
+
+.termsError {
+  margin: 6px 0 0;
+  color: var(--sd-bad);
+  font-size: 12px;
+}

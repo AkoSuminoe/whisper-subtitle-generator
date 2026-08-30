@@ -272,3 +272,98 @@ def test_worker_records_an_error_rather_than_dying(make_server, audio_bytes, mon
         assert "CUDA out of memory" in status["error"]
         # The service still accepts work afterwards.
         assert client.get("/api/health").json()["status"] == "ok"
+
+
+# --- Caller-supplied terms dictionary --------------------------------------------------
+
+def test_caller_terms_are_applied_to_that_job(make_server, audio_bytes):
+    client, _ = make_server()
+    with client:
+        job_id = upload(
+            client, audio_bytes, terms='{"buradayım": "buradayim"}'
+        ).json()["job_id"]
+        wait_for(client, job_id)
+        srt = client.get(f"/api/jobs/{job_id}/srt").text
+    assert "buradayim" in srt
+
+
+def test_terms_are_dropped_when_the_job_finishes(make_server, audio_bytes):
+    """The dictionary must not outlive the request that supplied it."""
+    client, main = make_server()
+    with client:
+        job_id = upload(client, audio_bytes, terms='{"a": "b"}').json()["job_id"]
+        wait_for(client, job_id)
+        assert main._jobs[job_id].terms is None
+
+
+def test_terms_are_never_written_to_disk(make_server, audio_bytes, tmp_path):
+    client, main = make_server()
+    before = {p.name for p in tmp_path.iterdir()}
+    with client:
+        job_id = upload(
+            client, audio_bytes, terms='{"gizli": "secret-marker"}'
+        ).json()["job_id"]
+        wait_for(client, job_id)
+
+    after = {p.name for p in tmp_path.iterdir()}
+    assert after == before or after - before <= {"budget.json"}
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            assert "secret-marker" not in path.read_text(encoding="utf-8", errors="ignore")
+
+
+def test_terms_are_isolated_between_jobs(make_server, audio_bytes):
+    """One caller's dictionary must not affect the next caller's transcript."""
+    client, _ = make_server()
+    with client:
+        first = upload(
+            client, audio_bytes, ip="10.9.0.1", terms='{"buradayım": "MARKED"}'
+        ).json()["job_id"]
+        wait_for(client, first)
+        assert "MARKED" in client.get(f"/api/jobs/{first}/srt").text
+
+        second = upload(client, audio_bytes, ip="10.9.0.2").json()["job_id"]
+        wait_for(client, second)
+        assert "MARKED" not in client.get(f"/api/jobs/{second}/srt").text
+
+
+def test_malformed_terms_are_rejected(make_server, audio_bytes):
+    client, _ = make_server()
+    with client:
+        assert upload(client, audio_bytes, terms="{not json").status_code == 400
+        assert upload(client, audio_bytes, terms='["a", "b"]').status_code == 400
+
+
+def test_oversized_terms_are_rejected(make_server, audio_bytes):
+    client, _ = make_server(MAX_TERMS_BYTES=200)
+    with client:
+        big = json.dumps({f"key{i}": f"value{i}" for i in range(100)})
+        assert upload(client, audio_bytes, terms=big).status_code == 413
+
+
+def test_too_many_terms_are_rejected(make_server, audio_bytes):
+    client, _ = make_server(MAX_TERMS_ENTRIES=3, MAX_TERMS_BYTES=100000)
+    with client:
+        many = json.dumps({f"k{i}": "v" for i in range(10)})
+        assert upload(client, audio_bytes, terms=many).status_code == 413
+
+
+def test_over_long_single_term_is_rejected(make_server, audio_bytes):
+    client, _ = make_server(MAX_TERM_LENGTH=10)
+    with client:
+        long_term = json.dumps({"x" * 50: "y"})
+        assert upload(client, audio_bytes, terms=long_term).status_code == 413
+
+
+def test_empty_terms_field_is_ignored(make_server, audio_bytes):
+    client, _ = make_server()
+    with client:
+        for value in ("", "   ", "{}"):
+            response = upload(client, audio_bytes, terms=value, ip=f"10.8.0.{len(value)}")
+            assert response.status_code == 200
+
+
+def test_terms_limits_are_advertised(make_server):
+    client, _ = make_server(MAX_TERMS_ENTRIES=42)
+    with client:
+        assert client.get("/api/health").json()["limits"]["max_terms_entries"] == 42

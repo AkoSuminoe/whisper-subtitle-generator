@@ -47,6 +47,7 @@ from subtitle_core import (  # noqa: E402
     load_terms,
     postprocess_segments,
     probe_duration,
+    validate_terms,
     whisper_cache_dir,
     whisper_progress,
 )
@@ -80,6 +81,13 @@ GLOBAL_AUDIO_MINUTES_PER_DAY = int(os.getenv("GLOBAL_AUDIO_MINUTES_PER_DAY", "18
 MAX_DISK_MB = int(os.getenv("MAX_DISK_MB", "1000"))
 JOB_TIMEOUT_SEC = int(os.getenv("JOB_TIMEOUT_SEC", "1800"))
 JOB_TTL_SEC = int(os.getenv("JOB_TTL_SEC", "3600"))
+
+# A caller may send their own dictionary. It is held in memory for the job and
+# never written to disk, so nothing survives the request. The caps bound both
+# memory and the size of the alternation regex built from it.
+MAX_TERMS_BYTES = int(os.getenv("MAX_TERMS_BYTES", "8192"))
+MAX_TERMS_ENTRIES = int(os.getenv("MAX_TERMS_ENTRIES", "200"))
+MAX_TERM_LENGTH = int(os.getenv("MAX_TERM_LENGTH", "100"))
 
 # Cloudflare Turnstile. Leave the secret empty to disable the check.
 TURNSTILE_SECRET = os.getenv("TURNSTILE_SECRET", "").strip()
@@ -123,6 +131,7 @@ class Job:
     created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
     source_path: Optional[str] = None
+    terms: Optional[dict] = None
 
 
 _jobs = {}
@@ -265,6 +274,34 @@ async def _verify_turnstile(token: str, ip: str) -> None:
         raise HTTPException(403, "Captcha verification failed. Reload and try again.")
 
 
+def _parse_request_terms(raw: str):
+    """Validate a caller-supplied terms dictionary, or return None if absent."""
+    raw = (raw or "").strip()
+    if not raw or raw == "{}":
+        return None
+
+    if len(raw.encode("utf-8")) > MAX_TERMS_BYTES:
+        raise HTTPException(413, f"The terms dictionary exceeds {MAX_TERMS_BYTES} bytes.")
+
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        raise HTTPException(400, f"The terms dictionary is not valid JSON: {exc}")
+
+    terms, _warning = validate_terms(parsed)
+    if not terms:
+        raise HTTPException(400, 'Terms must be a flat {"wrong": "correct"} object.')
+    if len(terms) > MAX_TERMS_ENTRIES:
+        raise HTTPException(413, f"At most {MAX_TERMS_ENTRIES} terms are allowed.")
+
+    for key, value in terms.items():
+        if len(key) > MAX_TERM_LENGTH or len(value) > MAX_TERM_LENGTH:
+            raise HTTPException(
+                413, f"Each term must be at most {MAX_TERM_LENGTH} characters."
+            )
+    return terms
+
+
 def _check_disk_quota() -> None:
     try:
         used = sum(f.stat().st_size for f in UPLOAD_DIR.glob("*") if f.is_file())
@@ -399,7 +436,11 @@ def _process_job(job_id: str) -> None:
             _speed["factor"] = _speed["factor"] * 0.7 + observed * 0.3
 
         _update(job_id, stage="Cleaning transcript", progress=1.0)
-        terms, _warning = load_terms(Path(TERMS_FILE) if TERMS_FILE else None)
+        # A caller-supplied dictionary applies to this job only.
+        if job.terms is not None:
+            terms = job.terms
+        else:
+            terms, _warning = load_terms(Path(TERMS_FILE) if TERMS_FILE else None)
         cues = postprocess_segments(
             result.get("segments", []), TermReplacer(terms, job.language)
         )
@@ -412,7 +453,9 @@ def _process_job(job_id: str) -> None:
             source.unlink(missing_ok=True)
         except OSError:
             pass
-        _update(job_id, source_path=None)
+        # The upload and the caller's dictionary are both needed only while the
+        # job runs; neither outlives it.
+        _update(job_id, source_path=None, terms=None)
 
 
 def _cleanup_loop() -> None:
@@ -482,6 +525,8 @@ def health():
             "rate_limit_per_hour": RATE_LIMIT_PER_HOUR,
             "rate_limit_per_day": RATE_LIMIT_PER_DAY,
             "max_queue_depth": MAX_QUEUE_DEPTH,
+            "max_terms_entries": MAX_TERMS_ENTRIES,
+            "max_terms_bytes": MAX_TERMS_BYTES,
             "api_key_required": bool(API_KEY),
         },
         "budget": _budget_snapshot(),
@@ -495,6 +540,7 @@ async def transcribe(
     language: str = Form("tr"),
     model: str = Form(""),
     turnstile_token: str = Form(""),
+    terms: str = Form(""),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
     # Cheapest checks first, so abuse is rejected before it costs anything.
@@ -520,6 +566,8 @@ async def transcribe(
         chosen = DEFAULT_MODEL
     elif chosen not in MODEL_CHOICES:
         raise HTTPException(400, f"Unknown model. Use one of {MODEL_CHOICES}.")
+
+    request_terms = _parse_request_terms(terms)
 
     suffix = Path(file.filename or "audio").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -576,6 +624,7 @@ async def transcribe(
         model=chosen,
         duration=duration,
         source_path=str(target),
+        terms=request_terms,
     )
     with _jobs_lock:
         _jobs[job_id] = job

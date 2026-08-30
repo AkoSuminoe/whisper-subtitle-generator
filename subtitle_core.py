@@ -152,8 +152,17 @@ def load_terms(path=None):
     except (OSError, ValueError) as exc:
         return {}, f"terms.json could not be read, so replacements were skipped.\n\n{exc}"
 
+    return validate_terms(raw)
+
+
+def validate_terms(raw):
+    """Coerce a parsed JSON object into a {str: str} mapping.
+
+    Shared by the file loader and the per-request dictionary the API accepts, so
+    both apply the same rules. Returns (mapping, warning); never raises.
+    """
     if not isinstance(raw, dict):
-        return {}, 'terms.json must be a flat {"wrong": "correct"} object. Replacements were skipped.'
+        return {}, 'Terms must be a flat {"wrong": "correct"} object. Replacements were skipped.'
 
     terms, ignored = {}, []
     for key, value in raw.items():
@@ -164,7 +173,7 @@ def load_terms(path=None):
 
     warning = None
     if ignored:
-        warning = "Ignored non-text entries in terms.json: " + ", ".join(ignored[:5])
+        warning = "Ignored non-text entries: " + ", ".join(ignored[:5])
     return terms, warning
 
 

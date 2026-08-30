@@ -40,6 +40,7 @@ Three pieces:
 
 - Cues are merged and split so they read at a sensible pace instead of matching the model's segment boundaries.
 - A terms file corrects the proper nouns the model reliably mishears. Copy `terms.example.json` to `terms.json` to start your own.
+- Callers of the API can send their own dictionary per request, so a visitor to a public demo can correct their own vocabulary without one being configured for them. It is held in memory for that job and never written to disk.
 - Turkish and English.
 
 ### Built to be exposed
@@ -61,7 +62,7 @@ Checks run cheapest first, so abuse is rejected before it costs anything: the AP
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/health` | Device, model, queue depth, whether a captcha is required, the active limits and the current budget |
-| `POST /api/transcribe` | Multipart upload. Returns a `job_id` |
+| `POST /api/transcribe` | Multipart upload. Optional `terms` field carries a per-request dictionary. Returns a `job_id` |
 | `GET /api/jobs/{id}` | Status, stage, progress, queue position and ETA |
 | `GET /api/jobs/{id}/srt` | The finished subtitles. `?download=1` for an attachment |
 | `DELETE /api/jobs/{id}` | Discard a job and its files |
@@ -114,8 +115,8 @@ The suite needs **no GPU and no network**. Torch and Whisper are replaced with s
 | Module | Coverage |
 | --- | --- |
 | `subtitle_core.py` | 94% |
-| `server/main.py` | 88% |
-| **Total** | **90%** — 88 tests |
+| `server/main.py` | 89% |
+| **Total** | **91%** — 98 tests |
 
 Every push runs the suite on Python 3.11, 3.12 and 3.13 via GitHub Actions; the badge above is that workflow, not a number typed into this file. The run fails if coverage drops below 88%, so the figure in the table cannot quietly rot: if it falls, the badge goes red. Each run also publishes a coverage table to its job summary.
 
@@ -189,6 +190,7 @@ Everything is environment driven; see `server/.env.example` for the full list wi
 | `RATE_LIMIT_PER_HOUR`, `RATE_LIMIT_PER_DAY` | Per client, and best effort: IP rotation defeats them |
 | `GLOBAL_*` | The real ceiling, and the only limits an attacker cannot rotate around |
 | `MAX_DISK_MB` | Stops a queue of large uploads filling the drive |
+| `MAX_TERMS_BYTES`, `MAX_TERMS_ENTRIES`, `MAX_TERM_LENGTH` | Bound a caller-supplied dictionary, and with it the regex built from it |
 | `ALLOW_MODEL_OVERRIDE` | Leave false unless you want callers choosing the model |
 
 ---
