@@ -25,8 +25,12 @@ def configure_utf8_console():
 APP_DIR = Path(__file__).resolve().parent
 TERMS_PATH = APP_DIR / "terms.json"
 
-# Hide the console window that ffprobe would otherwise flash on screen.
+# Hide the console window that ffprobe would otherwise flash on screen. The flag
+# is Windows-only: passing it elsewhere raises ValueError.
 CREATE_NO_WINDOW = 0x08000000
+_SUBPROCESS_FLAGS = (
+    {"creationflags": CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+)
 
 # --- Post-processing tuning knobs -------------------------------------------------
 MAX_LINE_CHARS = 32  # maximum characters on a single subtitle line
@@ -391,7 +395,7 @@ def probe_duration(path):
             encoding="utf-8",
             errors="replace",
             timeout=60,
-            creationflags=CREATE_NO_WINDOW,
+            **_SUBPROCESS_FLAGS,
         )
         if completed.returncode != 0:
             return None

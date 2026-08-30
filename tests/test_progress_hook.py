@@ -113,3 +113,24 @@ def test_probe_duration_returns_none_for_a_non_media_file(tmp_path):
 def test_whisper_cache_dir_is_under_the_cache_home(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     assert core.whisper_cache_dir() == str(tmp_path / "whisper")
+
+
+def test_probe_duration_reads_a_real_file(tmp_path):
+    """Runs ffprobe for real. Catches platform bugs a stubbed test cannot.
+
+    This is the test that would have caught `creationflags` being passed on
+    non-Windows platforms, where it raises and silently yields None.
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("ffmpeg is not installed")
+
+    clip = tmp_path / "tone.wav"
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "sine=frequency=440:duration=3", str(clip)],
+        check=True,
+    )
+    assert core.probe_duration(clip) == pytest.approx(3.0, abs=0.2)

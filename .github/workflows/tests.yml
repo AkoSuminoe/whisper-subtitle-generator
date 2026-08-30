@@ -1,0 +1,59 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # One test drives ffprobe for real, because stubbing it is exactly how a
+      # platform bug in the subprocess call slipped through once already.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # The CPU build is a fraction of the CUDA one and the suite never runs a
+      # model anyway: torch and Whisper are stubbed. Installing them regardless
+      # keeps the import surface honest.
+      - name: Install PyTorch (CPU)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # The threshold is what stops the coverage figure in the README drifting:
+      # if it falls, this job fails and the badge goes red.
+      - name: Run tests
+        run: pytest --cov --cov-report=term-missing --cov-report=xml --cov-fail-under=88
+
+      - name: Publish coverage to the job summary
+        if: always()
+        run: |
+          {
+            echo "## Coverage — Python ${{ matrix.python-version }}"
+            echo
+            coverage report --format=markdown
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: ignore
